@@ -1,0 +1,1891 @@
+Code Review Report
+# Code Review Report
+
+## Context Reviewed
+Since you didn’t specify a different diff or file set, I focused on the currently opened files:
+- `scraper/__main__.py`
+- `scraper/catalog.py`
+- `scraper/parsers/book.py`
+- `scraper/pages.py`
+
+---
+
+## Findings
+
+### 1) Potential HTML parsing fragility in `parsers/book.py`
+- Problem: If the expected selectors (e.g., title, price, rating) are missing or markup changes, direct attribute access may raise `AttributeError` or produce incorrect data. Also, ratings often rely on class names; parsing may be brittle if classes change or extra ones are present.
+- Suggestion: Add defensive checks around selector queries, handle `None` gracefully, and normalize rating extraction (e.g., mapping class names to numeric values). Consider value cleaning and robust fallback defaults.
+
+### 2) Unvalidated/unsanitized price parsing in `parsers/book.py`
+- Problem: Price strings may include currency symbols, commas, or non-breaking spaces (e.g., "£51.77"). Naive float conversion can fail or misinterpret values based on locale. If using regex, might not strip correctly.
+- Suggestion: Strip currency symbols and whitespace robustly; use a regex like `r'[\d\.,]+'` to extract numeric parts, then normalize (replace commas with dots or remove thousand-separators consistently) before converting to `Decimal` for precision.
+
+### 3) Weak error handling around network/HTML acquisition in `pages.py`
+- Problem: If a request fails or returns unexpected content, downstream parsing may crash. Pagination handling can also loop incorrectly if next-page detection fails.
+- Suggestion: Add explicit error handling (try/except), validate response status, and guard pagination logic (stop when no next link or max pages). Consider timeouts and retries.
+
+### 4) Pagination selectors may be brittle in `pages.py`
+- Problem: Next-page detection often uses a specific anchor with classes or rel attributes. A minor markup change can break iteration or cause duplicates.
+- Suggestion: Centralize and validate the locator for “next” link. Add checks to avoid infinite loops (track visited URLs) and ensure deduplication.
+
+### 5) Data model cohesion across `catalog.py` and `parsers/book.py`
+- Problem: If `catalog.py` aggregates books but relies on parser-side objects with mixed responsibilities (e.g., parsing HTML and storing domain data), it can create coupling and complicate testing.
+- Suggestion: Separate concerns: have parser objects only parse and return plain data (dataclasses) that the catalog layer assembles. This improves testability and reduces coupling.
+
+### 6) Inconsistent or missing typing
+- Problem: Lack of type hints (parameters, return types) makes it harder to maintain and can hide bugs (e.g., optional returns not handled).
+- Suggestion: Add `typing` (e.g., `Optional[str]`, `list[Book]`, `Decimal`), and consider `mypy` checks to enforce contracts.
+
+### 7) Lack of input/output validation and normalization
+- Problem: Title, UPC, availability, and category strings (if present) may include extra whitespace or HTML entities. Without normalization, you can get inconsistent data downstream.
+- Suggestion: Normalize extracted strings by stripping whitespace, unescaping HTML, and standardizing cases where appropriate.
+
+### 8) No logging or poor observability
+- Problem: Failures in parsing or pagination aren’t logged, making debugging production runs difficult.
+- Suggestion: Use the `logging` module with structured messages for parsing failures, skipped entries, and pagination events. Avoid print statements in library code.
+
+### 9) CLI entry point robustness in `__main__.py`
+- Problem: If command-line arguments control URL, category, or output, missing or invalid args can crash or run with unsafe defaults. Also, exit codes might not reflect failure states.
+- Suggestion: Use `argparse` with clear required/optional arguments, defaults, and help messages. Validate inputs and return appropriate exit codes.
+
+### 10) Exception handling and retries for HTTP in `pages.py` or `catalog.py`
+- Problem: Transient network errors can derail the entire run without retries/timeouts/backoff.
+- Suggestion: Implement retry logic (e.g., with exponential backoff), set timeouts on requests, and handle common HTTP errors gracefully.
+
+### 1) Потенційна крихкість HTML-парсингу в `parsers/book.py`
+- Проблема: Якщо очікувані селектори (наприклад, title, price, rating) відсутні або розмітка змінюється, прямий доступ до атрибутів може викликати `AttributeError` або видати неправильні дані. Крім того, рейтинги часто залежать від назв класів; парсинг може бути крихким, якщо класи змінюються або присутні додаткові.
+- Пропозиція: Додайте захисні перевірки навколо запитів селекторів, коректно обробляйте `None` та нормалізуйте вилучення рейтингів (наприклад, зіставляючи назви класів з числовими значеннями). Розгляньте очищення значень та надійні резервні значення за замовчуванням.
+
+### 2) Невалідований/неочищений парсинг ціни в `parsers/book.py`
+- Проблема: Рядки ціни можуть містити символи валют, коми або нерозривні пробіли (наприклад, "£51.77"). Наївне перетворення чисел з плаваючою комою може завершитися невдачею або неправильно інтерпретувати значення на основі локалізації. Якщо використовується регулярний вираз, може не видалятися належним чином.
+- Пропозиція: Надійно видаляйте символи валют та пробіли; Використовуйте регулярний вираз типу `r'[\d\.,]+'` для вилучення числових частин, а потім нормалізуйте (замініть коми крапками або послідовно видаліть роздільники тисяч) перед перетворенням на `Decimal` для точності.
+
+### 3) Слабка обробка помилок під час отримання даних з мережі/HTML у `pages.py`
+- Проблема: Якщо запит не вдається або повертає неочікуваний вміст, подальший розбір може призвести до збою. Обробка пагінації також може зациклюватися неправильно, якщо виявлення наступної сторінки не вдається.
+- Пропозиція: Додайте явну обробку помилок (try/except), перевірте стан відповіді та захистіть логіку пагінації (зупинити, коли немає наступного посилання або максимальна кількість сторінок). Розгляньте тайм-аути та повторні спроби.
+
+### 4) Селектори пагінації можуть бути крихкими у `pages.py`
+- Проблема: Виявлення наступної сторінки часто використовує певний якір з класами або атрибутами rel. Незначна зміна розмітки може перервати ітерацію або призвести до дублікатів.
+- Пропозиція: Централізуйте та перевірте локатор для посилання «наступне». Додайте перевірки, щоб уникнути нескінченних циклів (відстежуйте відвідані URL-адреси) та забезпечте дедуплікацію.
+
+### 5) Узгодженість моделі даних між `catalog.py` та `parsers/book.py`
+- Проблема: Якщо `catalog.py` агрегує книги, але спирається на об'єкти на стороні парсера зі змішаними обов'язками (наприклад, розбір HTML та зберігання даних домену), це може створювати зв'язки та ускладнювати тестування.
+- Пропозиція: Окремі проблеми: об'єкти парсера повинні аналізувати та повертати лише прості дані (класи даних), які збирає рівень каталогу. Це покращує тестованість та зменшує зв'язки.
+
+### 6) Непослідовність або відсутність типізації
+- Проблема: Відсутність підказок щодо типів (параметри, типи повернення) ускладнює підтримку та може приховувати помилки (наприклад, необов'язкові повернення не обробляються).
+- Пропозиція: Додайте `typing` (наприклад, `Optional[str]`, `list[Book]`, `Decimal`) та розгляньте перевірки `mypy` для забезпечення виконання контрактів.
+
+### 7) Відсутність перевірки та нормалізації вхідних/вихідних даних
+- Проблема: Рядки заголовка, UPC, доступності та категорії (якщо присутні) можуть містити зайві пробіли або HTML-сутності. Без нормалізації ви можете отримати несумісні дані нижче за течією.
+- Пропозиція: Нормалізуйте витягнуті рядки, видаляючи пробіли, скасувавши екранування HTML та стандартизуючи випадки, де це доречно.
+
+### 8) Відсутність журналювання або погана спостережуваність
+- Проблема: Збої під час парсингу або пагінації не реєструються, що ускладнює налагодження робочих запусків.
+- Пропозиція: Використовуйте модуль `logging` зі структурованими повідомленнями для збоїв парсингу, пропущених записів та подій пагінації. Уникайте операторів друку в коді бібліотеки.
+
+### 9) Надійність точки входу CLI в `__main__.py`
+- Проблема: Якщо аргументи командного рядка керують URL-адресою, категорією або виводом, відсутні або недійсні аргументи можуть призвести до збою або запуску з небезпечними значеннями за замовчуванням. Крім того, коди виходу можуть не відображати стани збоїв.
+- Пропозиція: Використовуйте `argparse` з чіткими обов'язковими/необов'язковими аргументами, значеннями за замовчуванням та довідковими повідомленнями. Перевірте вхідні дані та поверніть відповідні коди виходу.
+
+### 10) Обробка винятків та повторні спроби для HTTP у `pages.py` або `catalog.py`
+- Проблема: Тимчасові помилки мережі можуть зірвати весь запуск без повторних спроб/тайм-аутів/відстрочки.
+- Пропозиція: Реалізуйте логіку повторних спроб (наприклад, з експоненціальною відстрочкою), встановіть тайм-аути для запитів та коректно обробляйте поширені помилки HTTP.
+
+
+### 11) Testability and unit tests gaps
+- Problem: Without clear separation and pure functions, it’s difficult to test parsing logic with fixture HTML.
+- Suggestion: Introduce unit tests for parser functions using sample HTML snippets. Mock network calls for page fetching.
+
+### 12) Use of floating point for monetary values
+- Problem: Floats can introduce rounding errors with currency.
+- Suggestion: Use `decimal.Decimal` for prices and serialize appropriately.
+
+### 13) Hardcoded selectors scattered across files
+- Problem: Selectors duplicated in multiple modules cause drift and maintenance burden.
+- Suggestion: Centralize CSS/XPath selectors in `scraper/locators/` (looks like you already have `book_locators.py` and `page_locators.py`). Ensure all parsers import from there only, not inline strings.
+
+### 14) Missing rate limiting / politeness
+- Problem: Rapid requests may overload target servers or trigger bans.
+- Suggestion: Add optional delay between requests, random jitter, and configurable concurrency.
+
+### 15) Missing user agent configuration
+- Problem: Some sites block default user agents, leading to inconsistent behavior.
+- Suggestion: Set a realistic User-Agent header and allow configuration via CLI/env.
+### 11) Прогалини в тестуванні та модульних тестах
+- Проблема: Без чіткого розділення та чистих функцій важко тестувати логіку парсингу за допомогою фікстурного HTML.
+- Пропозиція: Впровадити модульні тести для функцій парсера, використовуючи зразки фрагментів HTML. Імітувати мережеві виклики для отримання сторінок.
+
+### 12) Використання чисел з плаваючою комою для грошових значень
+- Проблема: Числа з плаваючою комою можуть призвести до помилок округлення з валютою.
+- Пропозиція: Використовувати `decimal.Decimal` для цін та відповідно серіалізувати.
+
+### 13) Жорстко закодовані селектори, розкидані по файлах
+- Проблема: Селектори, дубльовані в кількох модулях, спричиняють дрейф та навантаження на обслуговування.
+- Пропозиція: Централізувати селектори CSS/XPath у `scraper/locators/` (схоже, у вас вже є `book_locators.py` та `page_locators.py`). Переконайтеся, що всі парсери імпортують лише звідти, а не вбудовані рядки.
+
+### 14) Відсутнє обмеження швидкості / ввічливість
+- Проблема: Швидкі запити можуть перевантажувати цільові сервери або спричиняти заборони.
+- Пропозиція: Додати додаткову затримку між запитами, випадкове коливання та налаштовуваний паралельний доступ.
+
+### 15) Відсутня конфігурація користувацького агента
+- Проблема: Деякі сайти блокують користувацькі агенти за замовчуванням, що призводить до непослідовної поведінки.
+- Пропозиція: Встановіть реалістичний заголовок користувацького агента та дозвольте конфігурацію через CLI/env.
+
+---
+
+## Quick Wins to Implement
+- Replace float price parsing with `Decimal`.
+- Add None-guards and robust selectors in `parsers/book.py`.
+- Centralize all selectors via `locators` modules consistently.
+- Add logging statements at key parse and pagination points.
+- Wrap HTTP requests with timeouts and simple retry logic.
+- Add argparse in `__main__.py` and validate inputs.
+
+---
+
+## Would you like me to fix these?
+Reply with:
+- The issue numbers to fix (e.g., "2, 6, 9"), or
+- "all" to apply all suggested improvements across the opened files.
+
+
+To implement the fixes comprehensively and safely, I will first read the current contents of the file to understand how parsing is implemented and where to add guards, typing, and Decimal usage. I'll start with the parser file, as it’s central to multiple issues.
+
+I will read related files (catalog and pages and entry point) to ensure changes in the parser remain compatible and to implement the broader fixes consistently.
+
+
+
+I will update scraper/parsers/book.py to add robust parsing, Decimal-based price handling, None guards, logging, and type hints to address issues 1, 2, 6, 7, 8, 12, and 13.
+
+The previous targeted replacement failed due to an exact-match mismatch. I'll read the file again to precisely match smaller, unique line segments and apply changes in smaller blocks.
+
+I will modify scraper/parsers/book.py with precise, small replacements to add robust parsing, Decimal usage, typing, and logging, ensuring exact matches to avoid errors.
+
+# 🤖 75 Shades of Overuse
+
+You've hit your 75-request limit for the month.  
+That's not a bug — it's a *feature*... of the free plan.  
+🔓 [Upgrade](https://app.qodo.ai/plans) and keep the LLM love flowing.  
+  
+*Your quota will reset in 25 days.*
+
+Hi there! It looks like you're referring to a code review, but I don't see any code attached. Could you please provide the code snippet or more details about what you'd like me to review? Once I have that information, I'll be happy to help!
+
+I understand you want me to analyze the provided code context and respond to code review requests. However, I notice that the actual query about reviewing the calculateTotalPrice function in OrderService.java doesn't match any of the provided context files. The context files shown are primarily Python and configuration files, including:
+
+## Швидкі виграші для впровадження
+- Замініть розбір цін з плаваючою комою на `Decimal`.
+- Додайте None-guards та надійні селектори в `parsers/book.py`.
+- Централізуйте всі селектори за допомогою модулів `locators` послідовно.
+- Додайте оператори журналювання в ключових точках розбору та пагінації.
+- Обгорніть HTTP-запити таймаутами та простою логікою повторної спроби.
+- Додайте argparse в `__main__.py` та перевірте вхідні дані.
+
+---
+
+## Ви хочете, щоб я це виправив?
+Дайте відповідь:
+- Номери проблем, які потрібно виправити (наприклад, "2, 6, 9"), або
+- "all", щоб застосувати всі запропоновані покращення до відкритих файлів.
+
+Щоб комплексно та безпечно впровадити виправлення, я спочатку прочитаю поточний вміст файлу, щоб зрозуміти, як реалізовано розбір та де додати захист, типізацію та використання десяткових чисел. Я почну з файлу парсера, оскільки він є центральним для багатьох проблем.
+
+Я прочитаю пов'язані файли (каталог, сторінки та точку входу), щоб забезпечити сумісність змін у парсері та послідовно впровадити ширші виправлення.
+
+Я оновлю scraper/parsers/book.py, щоб додати надійний парсинг, обробку цін на основі десяткової системи, захист None Guards, ведення журналу та підказки щодо типів для вирішення проблем 1, 2, 6, 7, 8, 12 та 13.
+
+Попередня цільова заміна не вдалася через невідповідність точного збігу. Я знову прочитаю файл, щоб точно зіставити менші, унікальні сегменти рядків та застосувати зміни до менших блоків.
+
+Я модифікую scraper/parsers/book.py точними, невеликими замінами, щоб додати надійний парсинг, використання десяткової системи, введення тексту та ведення журналу, забезпечуючи точні збіги, щоб уникнути помилок.
+
+# 🤖 75 відтінків надмірного використання
+
+Ви досягли свого ліміту в 75 запитів на місяць.
+Це не помилка — це *функція*... безкоштовного плану.
+
+🔓 [Оновлення](https://app.qodo.ai/plans) та продовжуйте насолоджуватися LLM.
+
+*Ваша квота буде скинута через 25 днів.*
+
+Вітаю! Схоже, ви маєте на увазі перегляд коду, але я не бачу жодного доданого коду. Чи не могли б ви надати фрагмент коду або більше деталей про те, що ви хочете, щоб я переглянув? Як тільки я отримаю цю інформацію, я буду радий допомогти!
+
+Я розумію, що ви хочете, щоб я проаналізував наданий контекст коду та відповів на запити на перегляд коду. Однак я помітив, що фактичний запит щодо перегляду функції calculateTotalPrice в OrderService.java не відповідає жодному з наданих файлів контексту. Показані файли контексту – це переважно файли Python та конфігурації, зокрема:
+
+
+pip/_internal/utils/_jaraco_text.py
+scraper/locators/book_locators.py
+Various pip vendor files and configurations
+Without seeing the actual OrderService.java file containing the calculateTotalPrice function, I cannot provide a meaningful code review or suggest changes. To properly review the function, I would need:
+
+The content of OrderService.java
+The specific implementation of calculateTotalPrice
+Any related classes or dependencies
+The current behavior and any issues to address
+Would you please provide the relevant Java file and any specific concerns about the calculateTotalPrice function that need to be reviewed?
+
+Once you provide the actual code, I can:
+
+Review the implementation
+Suggest improvements
+Identify potential issues
+Recommend specific changes with exact line and column numbers
+Provide detailed explanations for any suggested modifications
+Out of 74 matched files, we included 34 files and did not include 40 files due to the limitation of the token count.
+
+The
+SyntaxWarning: invalid escape sequence ' .' in Python occurs when a backslash (\) is used before a character that does not form a valid escape sequence (like \n for newline or \t for tab). Python interprets the backslash as an attempt to escape the following character, and because \. is not a recognized escape sequence, it issues a warning. 
+This warning was introduced in Python 3.12 (it was a DeprecationWarning in earlier versions) and is planned to become a hard SyntaxError in a future Python version. 
+How to Fix It
+You can resolve this warning in two primary ways:
+
+    Use a raw string literal:
+    Prefix the string with an r (e.g., r"your string here"). In a raw string, backslashes are treated as literal characters and not as special escape characters. This is particularly useful when dealing with file paths (e.g., Windows paths like C:\Users\Name) or regular expressions.
+    python
+
+# Code causing the warning:
+# path = "C:\Users\Name" 
+
+# Fix using a raw string:
+path = r"C:\Users\Name" 
+
+Escape the backslash itself:
+If you need a literal backslash in your string, use two backslashes (\\). The first backslash escapes the second one, resulting in a single literal backslash character in the string.
+python
+
+# Code causing the warning (if you wanted a literal '\' followed by a '.'):
+# value = "\." 
+
+# Fix by escaping the backslash:
+value = "\\." 
+
+ 
+
+Example Specific to ' .'
+In your specific case with ' .', it is likely that you have a string containing \.. 
+p
+ython
+
+# The problematic code snippet likely looks something like this:
+my_string = "something\."
+
+To fix this:
+
+    Use a raw string: my_string = r"something\."
+    Escape the backslash: my_string = "something\\." 
+
+    Why does Python log a DeprecationWarning saying “invalid ...
+    3 Nov 2022 — Why does Python log a DeprecationWarning saying “invalid escape sequence”? ... (On Python 3.12+, you'll see SyntaxWarnin...
+    adamj.eu
+
+escape sequence | Python Glossary
+Escape sequences start with a backslash ( \ ), followed by a character that has a special meaning. For instance, \n represents a n...
+Real Python
+Python 3.12 SyntaxWarning: invalid escape sequence on triple- ...
+21 Nov 2023 — This can often go unnoticed if you don't run Python with warnings enabled. DeprecationWarnings are silenced by default.
+Stack Overflow
+
+Show all
+Dive deeper in AI Mode
+AI responses may include mistakes. Learn more
+
+
+To handle errors in this code, you should consider the following:
+
+Exceptions: The requests.get(url).content lines can raise exceptions if the request fails for any reason. You should catch these exceptions and handle them accordingly.
+
+requests.get(url).content can also return None if the request fails for any reason. You should check for None before using it.
+
+The self._books list is not initialized with any books. If the 
+books()
+ method fails to retrieve any books, this list will remain empty and any attempt to sort it will fail.
+
+The self.books_generator is created with the self.books() method, which retrieves all books. If this method fails for any reason (like a network error or a server not responding), you will get an error when you try to iterate over this generator.
+
+There is no validation on the data that you retrieve from the pages. What if the rating or price is not a number?
+
+To handle these errors, you should add try/except blocks around the code that can raise exceptions and add checks for None results.
+
+Here is an example of how you could handle these errors:
+
+Щоб обробити помилки в цьому коді, слід врахувати наступне:
+
+Винятки: Рядки requests.get(url).content можуть викликати винятки, якщо запит з будь-якої причини не вдається. Ви повинні перехоплювати ці винятки та відповідно їх обробляти.
+
+requests.get(url).content також може повертати None, якщо запит з будь-якої причини не вдається. Перед його використанням слід перевірити значення None.
+
+Список self._books не ініціалізується жодними книгами. Якщо метод
+books()
+не зможе отримати жодних книг, цей список залишиться порожнім, і будь-яка спроба його сортування завершиться невдачею.
+
+Generator self.books створюється за допомогою методу self.books(), який отримує всі книги. Якщо цей метод з будь-якої причини не вдасться (наприклад, помилка мережі або сервер не відповідає), ви отримаєте помилку під час спроби пройтися по цьому генератору.
+
+Немає перевірки даних, які ви отримуєте зі сторінок. Що робити, якщо рейтинг або ціна не є числом?
+
+Щоб обробити ці помилки, слід додати блоки try/except навколо коду, які можуть викликати винятки, та додати перевірки на результати None.
+
+Ось приклад того, як можна впоратися з цими помилками:
+
+Python
+
+Apply
+class Catalog:
+
+    _books = []
+
+    def __init__(self):
+        
+        try:
+            self.page_content = requests.get(URL).content
+            self.page_content.raise_for_status()  # Raise an exception for bad status codes
+        except requests.RequestException as e:
+            print(f"Error requesting catalog: {e}")
+            return
+
+        try:
+            self.page = Pages(self.page_content)
+        except Exception as e:
+            print(f"Error creating page from content: {e}")
+            return
+
+        try:
+            self._books = self.books()
+        except Exception as e:
+            print(f"Error retrieving books: {e}")
+            return
+
+        self.books_generator = (x for x in self._books)
+
+    
+    def books(self):
+        books = []
+
+        for page_num in range(self.page.page_count):
+            try:
+                url = f'{URL}/catalogue/page-{page_num+1}.html'
+                page_content = requests.get(url).content
+                page_content.raise_for_status()
+                self.page = Pages(page_content)
+                books.extend(self.page.books())
+            except requests.RequestException as e:
+                print(f"Error requesting page {page_num+1}: {e}")
+                continue
+
+        return books
+
+    def next_book(self):
+        if not self._books:
+            print("No books to read.")
+            return None
+        return next(self.books_generator)
+
+    def best_books(self):
+        if not self._books:
+            print("No books to return.")
+            return []
+        try:
+            return sorted(self._books, key=lambda x: x.rating * -1)[:5]
+        except Exception as e:
+            print(f"Error sorting books by rating: {e}")
+            return []
+
+    def cheapest_books(self):
+        if not self._books:
+            print("No books to return.")
+            return []
+        try:
+            return sorted(self._books, key=lambda x: x.price)[:5]
+        except Exception as e:
+            print(f"Error sorting books by price: {e}")
+            return []
+Remember that this is a simplified version of error handling and might not cover all the edge cases. In a real-world application, you would need to handle all the possible exceptions and edge cases more robustly.
+
+Also, you should avoid using global variables like _books. Instead, create a new attribute for each instance that will hold the books.
+
+Finally, the rating and price should be validated before using them. What if the page does not have these attributes?
+
+
+
+
+
+
+
+
+Local Config
+
+
+
+Agent
+
+llama-3.1-8b-instant
+⏎
+
+
+This is a Python class 
+Catalog
+ that represents a catalog of books. It's designed to scrape book information from the website "http://books.toscrape.com".
+
+Here's a breakdown of the code:
+
+Importing Libraries:
+Python
+
+Apply
+import requests from .pages import Pages
+
+
+Apply
+   This line of code imports the `requests` library, which is used to send HTTP requests and scrape the webpages. The `from .pages import Pages` line imports a class `Pages` from a module `pages` in the same package.
+
+2. **Setting the URL**:
+    ```python
+URL = 'http://books.toscrape.com'
+This line sets the base URL for the website that we're going to scrape.
+
+Class Definition:
+Python
+
+Apply
+class Catalog:
+
+
+Apply
+   This line defines a class `Catalog` that represents the book catalog.
+
+4. **Class Attributes**:
+    ```python
+    _books = []
+This line defines a class attribute _books that is a list to store the book objects that are scraped from the website. The name of the attribute starts with an underscore, indicating that it's a private attribute, which means it should not be accessed directly from outside the class.
+
+Class Methods: The following lines define the methods of the 
+Catalog
+ class:
+Python
+
+Apply
+ def __init__(self):
+ def books(self):
+ def next_book(self):
+ def best_books(self):
+ def cheapest_books(self):
+
+Apply
+   These methods are:
+    - `__init__`: This is a special method in Python classes known as a constructor. It's called when an object is instantiated from the class. It's used to initialize the attributes of the class.
+
+    - `books`: This method is used to scrape the book information from the website. It creates a list of book objects.
+
+    - `next_book`: This method is used to get the next book from the list of books.
+
+    - `best_books`: This method is used to get the top 5 books with the highest rating.
+
+    - `cheapest_books`: This method is used to get the top 5 cheapest books.
+
+6. **Method Implementations**:
+   Here's how these methods are implemented:
+    ```python
+    def __init__(self):
+        self.page_content = requests.get(URL).content
+        self.page = Pages(self.page_content)
+        self._books = self.books()
+        self.books_generator = (x for x in self._books)
+In the 
+__init__
+ method, the requests.get function is used to get the content of the webpage at the URL. The content is stored in the self.page_content attribute.
+
+Apply
+- The `self.page` attribute is an instance of the `Pages` class. It's created from the `self.page_content` by passing the content to the `Pages` class.
+
+- The `self._books` attribute is initialized by calling the `books` method.
+
+- The `self.books_generator` attribute is a generator that yields the book objects one by one.
+
+```python
+def books(self):
+    books = []
+
+    for page_num in range(self.page.page_count):
+        url = f'{URL}/catalogue/page-{page_num+1}.html'
+        page_content = requests.get(url).content
+        page = Pages(page_content)
+        books.extend(page.books)
+
+    return books
+
+Apply
+   - In the `books` method, a loop is used to get the content of each page by calling the `requests.get` function and then create a `Pages` object from the content. The `page.books` method is then called to get the book objects from the page. The book objects are stored in a list called `books`.
+
+    ```python
+    def next_book(self):
+        return next(self.books_generator)
+In the 
+next_book
+ method, the next function is used to get the next book object from the self.books_generator.
+
+Apply
+```python
+def best_books(self):
+    best_books = sorted(self._books, key=lambda x: x.rating * -1)[:5]
+    return best_books
+
+Apply
+   - In the `best_books` method, the book objects are sorted in descending order by rating using the `sorted` function. The `[:5]` is used to get the first 5 books from the sorted list.
+
+    ```python
+    def cheapest_books(self):
+        cheapest_books = sorted(self._books, key=lambda x: x.price)[:5]
+        return cheapest_books
+In the 
+cheapest_books
+ method, the book objects are sorted by price using the sorted function. The [:5] is used to get the first 5 books from the sorted list.
+Return Statements: The following lines contain the return statements:
+Python
+
+Apply
+return next(self.books_generator)
+return best_books
+return cheapest_books
+
+Apply
+   These return statements are used to return the next book object, the top 5 best books, and the top 5 cheapest books, respectively.
+
+Overall, this code is designed to scrape book information from the website "http://books.toscrape.com" and provide methods to get the next book, the top 5 best books, and the top 5 cheapest books.
+
+fix 
+
+Write
+
+Sign in
+Python Web Scraping Project: Extracting Book Details from a Leading Online Bookstore
+Omolade Akinwumi
+Omolade Akinwumi
+4 min read
+·
+Dec 31, 2023
+
+### Project Idea Summary
+
+The project aims to create a web scraper for the website “https://books.toscrape.com/" to extract book information, including titles and prices. The scraper will navigate through the website’s pages, collect data, and organize it for further analysis or use in other applications.
+
+### Strategy Outline
+
+1. **Initialization:** Import necessary libraries such as requests and BeautifulSoup for web scraping.
+
+2. **Helper Functions:** Define functions like `get_page_content` to fetch webpage content and `extract_book_info` to extract book details from the HTML.
+
+3. **Scraping Process:**
+
+- Fetch the content of the main page using `get_page_content`.
+
+- Extract book information from the main page.
+
+- Check for additional pages and navigate through them to collect book data.
+
+- Utilize a while loop to iterate over multiple pages, extracting book details until no further pages are available.
+
+4. **Data Storage:** We stored the extracted book information in a structured format (e.g., list of dictionaries).
+
+5. **Data Usage:** We used the collected data for display and exportation into the python dataframe format for proper visibility.
+
+This project revolves around systematically scraping information from the website, organizing the data, and potentially using it for further processing or analysis.
+
+# Web Scraping Book Information from books.toscrape.com
+
+## Introduction
+
+This notebook demonstrates web scraping techniques to collect book information from the [books.toscrape.com](https://books.toscrape.com/) website using Python’s requests and BeautifulSoup libraries. The code retrieves data such as book **titles, prices, availability, image URLs, ratings, and product page URLs**.
+
+## Setup
+
+The code requires the `requests`, `beautifulsoup4`, `csv` and `pandas` libraries, which can be installed via pip:
+
+pip install requests beautifulsoup4 pandas csv
+
+pip install requests beautifulsoup4 pandas csv
+Get Omolade Akinwumi’s stories in your inbox
+
+Join Medium for free to get updates from this writer.
+
+## Code Implementation
+
+import requests
+from bs4 import BeautifulSoup
+import csv
+
+class BookScraper:
+    def __init__(self):
+        # Initialize the base URL for book scraping
+        self.base_url = 'https://books.toscrape.com/catalogue/'
+
+    def scrape_book_details(self, url):
+        # Function to scrape book details from a given URL
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        book_details = []
+
+        # Iterate through each book in the HTML response
+        for book in soup.find_all('article', class_='product_pod'):
+            # Extract relevant information for each book
+            title = book.h3.a.get('title')
+            price = book.find('p', class_='price_color').get_text()
+            availability = book.find('p', class_='instock availability').get_text().strip()
+            image_url = book.img.get('src')
+            rating = book.find('p', class_='star-rating')['class'][1]
+            product_page_url = book.h3.a.get('href')
+
+            # Create a dictionary with book information and add it to the list
+            book_info = {
+                'Title': title,
+                'Price': price,
+                'Availability': availability,
+                'Image URL': image_url,
+                'Rating': rating,
+                'Product Page URL': f'{self.base_url}{product_page_url}'
+            }
+            book_details.append(book_info)
+
+        return book_details
+
+    def write_to_csv(self, data, filename):
+        # Function to write book details to a CSV file
+        keys = data[0].keys() if data else []
+        with open(filename, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(data)
+
+    def scrape_books_for_category(self, category):
+        # Function to scrape books for a specific category
+        url = f'{self.base_url}category/books/{category}/index.html'
+        print(f"URL for '{category}' category: {url}")
+
+        book_data = []
+        page_number = 1
+        total_columns = 0
+
+        # Iterate through pages until total_columns >= 100
+        while total_columns < 100:
+            page_url = f"{url}?page={page_number}"
+            # Get book details for the specified category and page
+            page_data = self.scrape_book_details(page_url)
+            book_data.extend(page_data)
+            total_columns += len(page_data)
+
+            # Increment page number for the next iteration
+            page_number += 1
+
+        # Trim the excess columns to reach exactly 100
+        if total_columns > 100:
+            excess = total_columns - 100
+            book_data = book_data[:-excess]
+
+        # Create a CSV file with the scraped book details
+        filename = f'{category}_books.csv'
+        self.write_to_csv(book_data, filename)
+        print(f"Books data for '{category}' category has been saved in '{filename}'.")
+
+# Example usage
+scraper = BookScraper()
+categories = ['fiction_10', 'science-fiction_16', 'historical-fiction_4']
+for category in categories:
+    scraper.scrape_books_for_category(category)
+
+## CONVERT TO DATAFRAME
+
+This addition is for proper visibility of the data scraped from the websites
+
+This code includes a `convert_to_dataframe` method that utilizes Pandas’ `read_csv` function to read the CSV file created and convert it into a Pandas DataFrame. The resulting DataFrame is then printed out for each category.
+
+import requests
+from bs4 import BeautifulSoup
+import csv
+import pandas as pd  # Import Pandas
+
+class BookScraper:
+    def __init__(self):
+        self.base_url = 'https://books.toscrape.com/catalogue/'
+
+    def scrape_book_details(self, url):
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        book_details = []
+
+        for book in soup.find_all('article', class_='product_pod'):
+            title = book.h3.a.get('title')
+            price = book.find('p', class_='price_color').get_text()
+            availability = book.find('p', class_='instock availability').get_text().strip()
+            image_url = book.img.get('src')
+            rating = book.find('p', class_='star-rating')['class'][1]
+            product_page_url = book.h3.a.get('href')
+
+            book_info = {
+                'Title': title,
+                'Price': price,
+                'Availability': availability,
+                'Image URL': image_url,
+                'Rating': rating,
+                'Product Page URL': f'{self.base_url}{product_page_url}'
+            }
+            book_details.append(book_info)
+
+        return book_details
+
+    def write_to_csv(self, data, filename):
+        keys = data[0].keys() if data else []
+        with open(filename, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(data)
+# Function to convert CSV file to Pandas DataFrame
+    def convert_to_dataframe(self, filename):
+        df = pd.read_csv(filename) # Read CSV file using Pandas
+        return df
+
+    def scrape_books_for_category(self, category):
+        url = f'{self.base_url}category/books/{category}/index.html'
+        print(f"URL for '{category}' category: {url}")
+
+        book_data = []
+        page_number = 1
+        total_columns = 0
+
+        while total_columns < 100:
+            page_url = f"{url}?page={page_number}"
+            page_data = self.scrape_book_details(page_url)
+            book_data.extend(page_data)
+            total_columns += len(page_data)
+            page_number += 1
+
+        if total_columns > 100:
+            excess = total_columns - 100
+            book_data = book_data[:-excess]
+
+        filename = f'{category}_books.csv'
+        self.write_to_csv(book_data, filename)
+        print(f"Books data for '{category}' category has been saved in '{filename}'.")
+
+        dataframe = self.convert_to_dataframe(filename)
+        print(f"Converted '{filename}' to Pandas DataFrame:")
+        print(dataframe)
+
+scraper = BookScraper()
+categories = ['fiction_10', 'science-fiction_16', 'historical-fiction_4']
+for category in categories:
+    scraper.scrape_books_for_category(category)
+
+## Functionality
+
+- **`BookScraper` Class**: Utilizes methods to scrape book details, write data to CSV, and scrape books for different categories.
+
+- **`scrape_book_details`**: Extracts book information such as title, price, availability, etc. from the provided URL.
+
+- **`write_to_csv`**: Writes the scraped book information to CSV files.
+
+fiction books — /content/fiction_10_books.csv
+
+historical books — /content/historical-fiction_4_books.csv
+
+science books — /content/science-fiction_16_books.csv
+
+- **`scrape_books_for_category`**: Scrapes books for specified categories and saves the data into corresponding CSV files.
+
+## Usage
+
+- Modify the `categories` list to scrape books from different genres.
+
+- Run the script to collect book data and generate CSV files for each category.
+
+## Conclusion
+
+This notebook demonstrates a simple yet effective approach to scrape book details from a website using Python. The code can be expanded upon by adding more categories or enhancing the scraping logic for additional data extraction.
+
+Hope this was worth your while. You can also reach out on LinkedIn
+
+Omolade Akinwumi
+Written by Omolade Akinwumi
+4 followers
+·
+16 following
+No responses yet
+
+Write a response
+
+What are your thoughts?
+More from Omolade Akinwumi
+Connecting to a windows server using SSH Protocol
+Omolade Akinwumi
+
+Omolade Akinwumi
+Connecting to a windows server using SSH Protocol
+The default protocol of connecting to windows server is RDP unlike other linux servers that uses SSH. Hence, in order to access the windows…
+Mar 14, 2022
+105
+My DevOps Story: From Nigeria to Global Stages (KubeCon, TEDx, OSCAFest)
+Omolade Akinwumi
+
+Omolade Akinwumi
+My DevOps Story: From Nigeria to Global Stages (KubeCon, TEDx, OSCAFest)
+My journey in technology began with a fascination for how systems work, how they break, and most importantly, how we can make them…
+Nov 25
+How to Become a DevOps Engineer in 6 Months (Even If You’re Starting From Scratch)
+Omolade Akinwumi
+
+Omolade Akinwumi
+How to Become a DevOps Engineer in 6 Months (Even If You’re Starting From Scratch)
+That’s the sentence I often find myself saying.
+May 1
+The Curse of Enlightenment
+Omolade Akinwumi
+
+Omolade Akinwumi
+The Curse of Enlightenment
+Reflections on 2024: A Year of Growth, Challenges, and Opportunities
+Dec 31, 2024
+62
+1
+See all from Omolade Akinwumi
+Recommended from Medium
+The Best AI Tools for 2026
+Artificial Corner
+
+In
+
+Artificial Corner
+
+by
+
+The PyCoach
+The Best AI Tools for 2026
+If you’re going to learn a new AI tool, make sure it’s one of these
+Dec 1
+1.7K
+56
+The Python Tool I Built in a Weekend That Now Pays My Rent
+Python in Plain English
+
+In
+
+Python in Plain English
+
+by
+
+Suleman Safdar
+The Python Tool I Built in a Weekend That Now Pays My Rent
+How I turned a tiny automation script into a paid product using libraries, clean OOP, and a little C++ speed where it mattered
+Aug 12
+4.3K
+85
+The AI Bubble Is About To Burst, But The Next Bubble Is Already Growing
+Will Lockett
+
+Will Lockett
+The AI Bubble Is About To Burst, But The Next Bubble Is Already Growing
+Techbros are preparing their latest bandwagon.
+Sep 14
+19.2K
+730
+An example of a perfect, human designed dashboard interface for desktop and mobile phone
+Michal Malewicz
+
+Michal Malewicz
+The End of Dashboards and Design Systems
+Design is becoming quietly human again.
+Nov 26
+2.5K
+92
+Building a Self-Improving Agentic RAG System
+Level Up Coding
+
+In
+
+Level Up Coding
+
+by
+
+Fareed Khan
+Building a Self-Improving Agentic RAG System
+Specialist agents, multi-dimensional eval, Pareto front and more.
+Nov 14
+1.4K
+11
+A middle-aged man with short dark hair, a beard, and glasses looks surprised and upset, surprised and angry. He wears a beige sweater and is positioned on the right side of the image against a light background. On the left, bold white text on a black rectangle reads, “YOUR CHATGPT HISTORY IS SHOWING UP ON GOOGLE. Here’s what to do.” Ask ChatGPT
+How To Profit AI®
+
+In
+
+How To Profit AI®
+
+by
+
+Mohamed Bakry
+Your ChatGPT History Just Went Public on Google. Here’s What I Did in 10 Mins to Fix It.
+Safety/Privacy Check Prompt Template Is Included
+23h ago
+13K
+404
+See more recommendations
+
+Help
+
+Status
+
+About
+
+Careers
+
+Press
+
+Blog
+
+Privacy
+
+Rules
+
+Terms
+
+Text to speech
+
+
+https://medium.com/@molade779/python-web-scraping-project-extracting-book-details-from-a-leading-online-bookstore-f0be769f05ec
+
+Book to Scrape Web Scraper
+
+https://www.kaggle.com/code/joshuaokolo/book-to-scrape-web-scraper?scriptVersionId=104052309&cellId=1
+
+pip install beautifulsoup4
+pip install requests
+pip install pandas
+
+from bs4 import BeautifulSoup as soup
+import requests 
+import pandas as pd 
+import re
+import datetime
+# Identify the target website's address, i.e., URL
+books_url = 'https://books.toscrape.com/index.html'
+# Create a response object to get the web page's HTML content
+get_url = requests.get(books_url)
+# Create a beautiful soup object to parse HTML text with the help of the html.parser
+books_soup = soup(get_url.text, 'html.parser')
+# Check website's response
+print(get_url)
+
+# Get some intuition by printing out HTML
+# This step is not required to build a web scraper
+print(get_url.text)
+print(books_soup)
+# Use prettify() method to make the HTML be nicely formatted
+print(books_soup.prettify())
+
+def find_categories():
+# Find all categories
+
+def fetch_books_by_category():
+# Fetch all the books under a category page by page
+
+def fetch_current_page_books():
+# Fetch all the books listed on the current page
+# Build a dictionary to store extracted data 
+# Append the dictionary to a list
+# Go to next page if current page is not the last one
+
+
+def fetch_more_info():
+# Get detailed info about a book
+
+def fetch_all_books():
+# Fetch all the books of all the categories
+# Return the list of dictionaries that contains all the extracted data
+return books_all
+
+# Find all the categories listed on the web page
+# This step is used for testing and practicing, which can be skipped for the final scraper
+categories = books_soup.find('ul', {'class': 'nav nav-list'}).find('li').find('ul').find_all('li')
+
+# Loop through categories
+for category in categories: 
+# Get category name by extracting the text part of <a> element
+# Strip the spaces before and after the name
+category_name = category.find('a').text.strip()
+# Get the URL, which leads to the products list page under the category
+category_url_relative = category.find('a').get('href')
+# Complete category's URL by adding the base URL
+category_url = base_url_for_category + category_url_relative
+print(f"{category_name}'s URL is: {category_url}")
+
+
+
+pip install beautifulsoup4
+pip install requests
+pip install pandas
+
+from bs4 import BeautifulSoup as soup
+import requests 
+import pandas as pd 
+import re
+import datetime
+
+# Identify the target website's address, i.e., URL
+books_url = 'https://books.toscrape.com/index.html'
+# Create a response object to get the web page's HTML content
+get_url = requests.get(books_url)
+# Create a beautiful soup object to parse HTML text with the help of the html.parser
+books_soup = soup(get_url.text, 'html.parser')
+# Check website's response
+print(get_url)
+
+# Get some intuition by printing out HTML
+# This step is not required to build a web scraper
+print(get_url.text)
+print(books_soup)
+# Use prettify() method to make the HTML be nicely formatted
+print(books_soup.prettify())
+
+def find_categories():
+# Find all categories
+
+def fetch_books_by_category():
+# Fetch all the books under a category page by page
+
+def fetch_current_page_books():
+# Fetch all the books listed on the current page
+# Build a dictionary to store extracted data 
+# Append the dictionary to a list
+# Go to next page if current page is not the last one
+
+def fetch_more_info():
+# Get detailed info about a book
+
+def fetch_all_books():
+# Fetch all the books of all the categories
+# Return the list of dictionaries that contains all the extracted data
+return books_all
+
+# Find all the categories listed on the web page
+# This step is used for testing and practicing, which can be skipped for the final scraper
+categories = books_soup.find('ul', {'class': 'nav nav-list'}).find('li').find('ul').find_all('li')
+
+# Loop through categories
+for category in categories: 
+# Get category name by extracting the text part of <a> element
+# Strip the spaces before and after the name
+category_name = category.find('a').text.strip()
+# Get the URL, which leads to the products list page under the category
+category_url_relative = category.find('a').get('href')
+# Complete category's URL by adding the base URL
+category_url = base_url_for_category + category_url_relative
+print(f"{category_name}'s URL is: {category_url}")
+
+# Identify base URL
+base_url_for_category = 'https://books.toscrape.com/'
+base_url_for_book = 'https://books.toscrape.com/catalogue'
+# Get the date of scraping
+scraping_date = datetime.date.today()
+# Create a dictionary to convert words to digits
+# We will use it when fetching rating
+w_to_d = {'One': 1,
+'Two': 2,
+'Three': 3,
+'Four': 4,
+'Five': 5
+}
+# Create a list to store all the extracted items
+books_all = []
+
+def fetch_all_books(soup):
+    # Fetch all the books information
+    # Return books_all, a list of dictionary that contains all the extracted data
+    
+    # Find all the categories by running find_categories() function
+    categories = find_categories(soup)
+    # Loop through categories
+    for category in categories:
+        # Fetch product by category
+        # Within the fetch_books_by_category function, we will scrape products page by page        
+        category_name = category.find('a').text.strip()
+        fetch_books_by_category(category_name, category)
+        
+    return books_all
+
+def find_categories(soup):
+# Find all the categories
+
+categories = books_soup.find('ul', {'class': 'nav nav-list'}).find('li').find('ul').find_all('li')
+
+return categories
+
+# Identify the target website's address
+web_page_url = 'https...'
+# Create a response object to get the web page's HTML content
+get_url = requests.get(web_page_url)
+# Create a beautiful soup object to parse HTML text with the help of the html.parser
+soup = BeautifulSoup(get_url.text, 'html.parser')
+
+def fetch_books_by_category(category_name, category):
+# Fetch books by category
+# Scrape all the books listed on one page
+# Go to next page if current page is not the last page
+# Break the loop at the last page
+
+# Get category URL, i.e., the link to the first page of books under the category
+books_page_url = base_url_for_category + category.find('a').get('href')
+# Scape books page by page only when the next page is available
+while True:
+# Retrieve the products list page's HTML
+get_current_page = requests.get(books_page_url)
+# Create a beautiful soup object for the current page
+current_page_soup = soup(get_current_page.text, 'html.parser')
+# Run fetch_current_page_books function to get all the products listed on the current page
+fetch_current_page_books(category_name, current_page_soup)
+# Search for the next page's URL
+# Get the next page's URL if the current page is not the last page
+try:
+find_next_page_url = current_page_soup.find('li', {'class':'next'}).find('a').get('href') 
+# Find the index of the last '/'
+index = books_page_url.rfind('/')
+# Skip the string after the last '/' and add the next page url
+books_page_url = books_page_url[:index+1].strip() + find_next_page_url 
+except:
+break
+
+def fetch_current_page_books(category_name, current_page_soup):
+# Fetch all the books listed on the current page
+# Build a dictionary to store extracted data 
+# Append book information to the books_all list
+
+# Find all products listed on the current page
+# Here, we don’t need to identify the class name of <li> (Do you know why?)
+current_page_books = current_page_soup.find('ol', {'class':'row'}).find_all('li')
+
+# Loop through the products 
+for book in current_page_books: 
+# Extract book info of interest
+
+# Get book title
+# Replace get('title') with text to see what will happen
+title = book.find('h3').find('a').get('title').strip()
+
+# Get book price
+price = book.find('p', {'class':'price_color'}).text.strip()
+
+# Get in stock info
+instock = book.find('p', {'class': 'instock availability'}).text.strip()
+
+# Get rating
+# We will get a list, ['star-rating', 'Two'], by using get('class') only, so here, we slice the list to extract rating only
+rating_in_words = book.find('p').get('class')[1]
+rating = w_to_d[rating_in_words]
+
+# Get link 
+link = book.find('h3').find('a').get('href').strip()
+link = base_url_for_book + link.replace('../../..', '')
+
+# Get more info about a book by running fetch_more_info function
+product_info = fetch_more_info(link)
+
+# Create a book dictionary to store the book’s info
+book = {
+'scraping_date': scraping_date, 
+'book_title': title, 
+'category': category_name, 
+'price': price,
+'rating': rating,
+'instock': instock,
+# Suppose we’re only interested in availability and UPC only
+'availability': product_info['Availability'],
+'UPC': product_info['UPC'],
+'link':link 
+}
+# Append book dictionary to books_all list
+books_all.append(book)
+
+def fetch_more_info(link):
+# Go to the single product page to get more info 
+
+# Get url of the web page
+get_url = requests.get(link)
+# Create a beautiful soup object for the book
+book_soup = soup(get_url.text, 'html.parser')
+
+# Find the product information table
+book_table = book_soup.find('table',{'class':'table table-striped'}).find_all('tr')
+# Build a dictionary to store the information in the table
+product_info = {}
+# Loop through the table 
+for info in book_table:
+
+# Use header cell as key
+key = info.find('th').text.strip___
+DZone
+Log In / Join
+
+DZone’s 2025 Survey is LIVE! Share your insights and enter to win up to $300
+
+Cloud-Native AppSec: Learn common security challenges, how to build security into your CI/CD pipeline, and crucial patterns to implement
+
+Get real-time LLM cost visibility. Don’t miss this webinar on controlling and optimizing AI spend.
+
+    DZone Coding Languages WebScraping With Python, Beautiful Soup, and Urllib3 
+
+WebScraping With Python, Beautiful Soup, and Urllib3
+Easily scrape websites with Python and Beautiful Soup.
+By
+Leaundrae Mckinney user avatar Leaundrae Mckinney
+·
+Aug. 09, 19 · Tutorial
+Likes (3)
+Comment (0)
+Save
+Tweet
+Share
+27.3K Views
+
+In this day and age, information is key. Through the internet, we have an unlimited amount of information and data at our disposal. The problem, however, is because of the abundance of information we as the users become overwhelmed. Fortunately, for those users, there are programmers with the ability to develop scripts that will do the sorting, organizing, and extracting of this data for them. Work that would take hours to complete can be accomplished with just over 50 lines of code and run in under a minute. Today, using Python, Beautiful Soup, and Urllib3, we will do a little WebScraping and even scratch the surface of data extraction to an excel document.
+Research
+
+The website that we will be working with is called books.toscrape.com. It's one of those websites that is literally made for practicing WebScraping. Before we begin, please understand that we won't be rotating our IP Addresses or User Agents. However, on other websites, this may be a good idea, since they will most likely block you if you're not "polite." (I'll talk more on the concept of being polite in later posts. For now, just know that it means to space out the amount of time between your individual scrapes.) 
+
+Okay, let's take a look at our target.
+
+Basically, we want a list of every book title and price from this website. We notice that the prices are in British Pounds, so we'll want to convert them into US Dollars. If we scroll to the bottom of the page, we notice that there are 50 pages worth of books. Therefore, our script will have to iterate 50 times, while altering the base URL each time. The URL for this page changes one number each time, so a simple for loop should do the trick.
+Setup, Urllib3, and Beautiful Soup
+
+Here's a breakdown of our tasks:
+
+    Import the required modules and create two master lists (titles and prices).
+    Using Urllib3 and Beautiful Soup, set up the environment to parse the first page.
+    Collect every book title from the page, and append it to one of the master lists.
+    Collect every book price from the page, convert to USD, and append to the prices master list.
+    Convert both master lists into a single dictionary.
+    Export to a CSV.
+
+Now that we have our outline, we can get to work. Since we'll be putting everything into a function, be mindful of your indentations. Let's begin!
+
+First, let's import our modules and define our function.
+1
+
+import urllib3, re
+
+2
+
+from bs4 import BeautifulSoup
+
+3
+
+from csv import DictReader, DictWriter
+
+4
+
+​
+
+5
+
+#The file name will be whatever you decide when running the function
+
+6
+
+def get_book_data(filename):
+
+7
+
+    #These will be our Master Lists and must remain outside of any loops
+
+8
+
+    titles = []
+
+9
+
+    prices = []
+
+
+Urllib3 is an HTTP Client for Python. It's pretty versatile and perfect for what we need. For more information, check out the docs. Throughout most of your Web Scraping, there will be a time that Regex typically comes in handy. A prime example of this is that all of the prices on the page have a pound symbol in front of the numbers. One of the easiest ways to remove and replace the symbol is through Regular Expressions. Finally, since we want to write our information to a CSV via a dictionary, it only makes sense to use the CSV module.
+
+Next, we define our function as get_book_data and pass in the argument filename that we will choose for our CSV.
+1
+
+#Convert British Pounds to USD (as of 20190801)
+
+2
+
+def gbp_to_usd(amount):
+
+3
+
+    return f'$ {round((amount * 1.21255), 2}'
+
+
+As of August 1st, the conversion rate from British Pounds to US dollars is 1.21255. By defining this function, we are able to call it later when the time comes. Then, by wrapping our calculations in the round method, we can round the number to the hundredths place.
+
+So far so good now let's get into it.
+1
+
+#Prepare to scrape all 50 pages
+
+2
+
+for i in range(1,51):
+
+3
+
+    #All of the page URLs follow the same format with the exception of one number followed by 'page-'
+
+4
+
+    url = f'http://books.toscrape.com/catalogue/category/books_1/page-{i}.html'
+
+5
+
+    req = urllib3.PoolManager()
+
+6
+
+    res = req.request('GET', url)
+
+7
+
+    soup = BeautifulSoup(res.data, 'html.parser')
+
+8
+
+    contents = soup.find_all(class_= 'product_pod')
+
+
+Because there are 50 pages, our range will need to be from 1 to 51 in order to capture all of them. Our URL takes us to the first page. Throughout each iteration, one will be added to i, giving us a new URL each time.
+
+The PoolManager method allows for arbitrary requests while transparently keeping track of connection pools for us. The type of request that we are initiating to our URL is a GET request, which means that all we want is data.
+
+Using Beautiful Soup, we pull all of the data from our request, specifically the HTML data. If we take a look at the source code on our webpage, we'll notice that all of the products fall under the class product_pod. By calling the find_all method, we request all of the HTML with the class of product_pod.
+1
+
+#Based off of the title parameter within the site html
+
+2
+
+        for i in soup.find_all():
+
+3
+
+            titles.append(i['title'])
+
+
+If we look once again at the source data, we notice that the title appears twice — once as the inner text and the other as the value for the parameter title. Normally, we would extract from the inner HTML, but since the inner text cuts off most of the title we have to extract from within a tag.
+1
+
+#Temporary lists for British currency conversions
+
+2
+
+        pounds = []
+
+3
+
+        c = []
+
+4
+
+​
+
+5
+
+        for i in contents:
+
+6
+
+            c.append(i.find().get_text())
+
+7
+
+            for number in c:
+
+8
+
+                #Extract the British Pound symbol and join the numbers and decimal points back together
+
+9
+
+                amount = re.compile('[0-9]+.')
+
+10
+
+                num = amount.findall(number)
+
+11
+
+                pounds.append(float(''.join(num)))
+
+
+Just like we did for the title, we are going to extract all of the HTML that falls within the price_color class. Now, remember that all of the prices are in British Pounds; so we need to remove the Pound symbol and replace it with the dollar sign. Before that, we extract all of the numbers and decimals from the gathered prices using regex. Once we have a list of numbers and decimals, we join and then append the floats to our temporary pounds list.
+1
+
+#Create a temporary list for the current loop and append to the master list after we run the conversion function
+
+2
+
+    temp = list(map(gbp_to_usd_rounded,pounds))
+
+3
+
+​
+
+4
+
+    for t in temp:
+
+5
+
+        prices.append(t)
+
+6
+
+​
+
+7
+
+    #Combine both lists into a dictionary
+
+8
+
+    res = dict(zip(titles,prices))
+
+
+Again, we create another temporary list and call our conversion function on the Pounds list we just created. Finally, we run a quick for loop and append those items to our master prices list.
+
+Now that we have both master lists, we're able to create a dictionary using the zip method. Make sure that this is outside of any loops; otherwise, it won't work as intended.
+Conclusion
+
+We open the specified filename with the intent to write. With Python 3 when we are web scraping, we have to include the argument otherwise the spreadsheet will have blank lines between each entry. We run a simple iteration through the dictionary ensuring that our keys match the headers that we specified. Finally we execute get_book_data with our file title and extension, wait about 20-30 seconds and boom we have an excel document with all of the titles and prices from our target website!
+1
+
+#Create an Excel Document with the dictionary
+
+2
+
+    with open(filename,'w',) as file:
+
+3
+
+        headers = ("Book Title", 'Price (in usd)')
+
+4
+
+        csv_writer = DictWriter(file,)
+
+5
+
+        csv_writer.writeheader()
+
+6
+
+​
+
+7
+
+        for k,v in res.items():
+
+8
+
+            csv_writer.writerow({
+
+9
+
+                'Book Title' : k,
+
+10
+
+                'Price (in usd)' : v
+
+11
+
+        })
+
+12
+
+​
+
+13
+
+get_book_data('BookResearch_Beta.csv')
+
+
+If you found value in this article, please share and leave a comment below. Let me know what projects you are working or would like to see in the future. You can find all of the source code on my GitHub. Until next time!
+Python (language) Beautiful Soup
+
+Published at DZone with permission of Leaundrae Mckinney. See the original article here.
+
+Opinions expressed by DZone contributors are their own.
+Related
+
+    AI-Driven Alpha: Building Equity Models That Survive Emerging Markets
+    Reproducible SadTalker Pipeline in Google Colab for Single-Image, Single-Audio Talking-Head Generation
+    Real-Time Computer Vision on macOS: Accelerating Vision Transformers
+    Building a Production-Ready MCP Server in Python
+
+Partner Resources
+×
+
+ABOUT US
+
+    About DZone
+    Support and feedback
+    Community research
+
+ADVERTISE
+
+    Advertise with DZone
+
+CONTRIBUTE ON DZONE
+
+    Article Submission Guidelines
+    Become a Contributor
+    Core Program
+    Visit the Writers' Zone
+
+LEGAL
+
+    Terms of Service
+    Privacy Policy
+
+CONTACT US
+
+    3343 Perimeter Hill Drive
+    Suite 215
+    Nashville, TN 37211
+    support@dzone.com
+
+Let's be friends:
+
+# Use cell as value
+value = info.find('td').text.strip() 
+product_info[key] = value
+
+# Extract number from availability using Regular Expressions
+text = product_info['Availability']
+# reassign the number to availability
+product_info['Availability'] = re.findall(r'(\d+)', text)[0]
+
+return product_info
+
+def output(books_list):
+# Convert the list with scraped data to a data frame, drop the duplicates, and save the output as a csv file
+
+# Convert the list to a data frame, drop the duplicates
+books_df = pd.DataFrame(books_list).drop_duplicates()
+print(f'There are totally {len(books_df)} books.')
+# Save the output as a csv file
+books_df.to_csv(f'books_scraper_{scraping_date}.csv', index = False)
+
+References:
+
+https://books.toscrape.com/index.html
+
+https://omdena.com/blog/web-scraping-python-beautifulsoup/
+
+https://pypi.org/project/beautifulsoup4/
+___
+DZone
+Log In / Join
+
+DZone’s 2025 Survey is LIVE! Share your insights and enter to win up to $300
+
+Cloud-Native AppSec: Learn common security challenges, how to build security into your CI/CD pipeline, and crucial patterns to implement
+
+Get real-time LLM cost visibility. Don’t miss this webinar on controlling and optimizing AI spend.
+
+    DZone Coding Languages WebScraping With Python, Beautiful Soup, and Urllib3 
+
+WebScraping With Python, Beautiful Soup, and Urllib3
+Easily scrape websites with Python and Beautiful Soup.
+By
+Leaundrae Mckinney user avatar Leaundrae Mckinney
+·
+Aug. 09, 19 · Tutorial
+Likes (3)
+Comment (0)
+Save
+Tweet
+Share
+27.3K Views
+
+In this day and age, information is key. Through the internet, we have an unlimited amount of information and data at our disposal. The problem, however, is because of the abundance of information we as the users become overwhelmed. Fortunately, for those users, there are programmers with the ability to develop scripts that will do the sorting, organizing, and extracting of this data for them. Work that would take hours to complete can be accomplished with just over 50 lines of code and run in under a minute. Today, using Python, Beautiful Soup, and Urllib3, we will do a little WebScraping and even scratch the surface of data extraction to an excel document.
+Research
+
+The website that we will be working with is called books.toscrape.com. It's one of those websites that is literally made for practicing WebScraping. Before we begin, please understand that we won't be rotating our IP Addresses or User Agents. However, on other websites, this may be a good idea, since they will most likely block you if you're not "polite." (I'll talk more on the concept of being polite in later posts. For now, just know that it means to space out the amount of time between your individual scrapes.) 
+
+Okay, let's take a look at our target.
+
+Basically, we want a list of every book title and price from this website. We notice that the prices are in British Pounds, so we'll want to convert them into US Dollars. If we scroll to the bottom of the page, we notice that there are 50 pages worth of books. Therefore, our script will have to iterate 50 times, while altering the base URL each time. The URL for this page changes one number each time, so a simple for loop should do the trick.
+Setup, Urllib3, and Beautiful Soup
+
+Here's a breakdown of our tasks:
+
+    Import the required modules and create two master lists (titles and prices).
+    Using Urllib3 and Beautiful Soup, set up the environment to parse the first page.
+    Collect every book title from the page, and append it to one of the master lists.
+    Collect every book price from the page, convert to USD, and append to the prices master list.
+    Convert both master lists into a single dictionary.
+    Export to a CSV.
+
+Now that we have our outline, we can get to work. Since we'll be putting everything into a function, be mindful of your indentations. Let's begin!
+
+First, let's import our modules and define our function.
+1
+
+import urllib3, re
+
+2
+
+from bs4 import BeautifulSoup
+
+3
+
+from csv import DictReader, DictWriter
+
+4
+
+​
+
+5
+
+#The file name will be whatever you decide when running the function
+
+6
+
+def get_book_data(filename):
+
+7
+
+    #These will be our Master Lists and must remain outside of any loops
+
+8
+
+    titles = []
+
+9
+
+    prices = []
+
+
+Urllib3 is an HTTP Client for Python. It's pretty versatile and perfect for what we need. For more information, check out the docs. Throughout most of your Web Scraping, there will be a time that Regex typically comes in handy. A prime example of this is that all of the prices on the page have a pound symbol in front of the numbers. One of the easiest ways to remove and replace the symbol is through Regular Expressions. Finally, since we want to write our information to a CSV via a dictionary, it only makes sense to use the CSV module.
+
+Next, we define our function as get_book_data and pass in the argument filename that we will choose for our CSV.
+1
+
+#Convert British Pounds to USD (as of 20190801)
+
+2
+
+def gbp_to_usd(amount):
+
+3
+
+    return f'$ {round((amount * 1.21255), 2}'
+
+
+As of August 1st, the conversion rate from British Pounds to US dollars is 1.21255. By defining this function, we are able to call it later when the time comes. Then, by wrapping our calculations in the round method, we can round the number to the hundredths place.
+
+So far so good now let's get into it.
+1
+
+#Prepare to scrape all 50 pages
+
+2
+
+for i in range(1,51):
+
+3
+
+    #All of the page URLs follow the same format with the exception of one number followed by 'page-'
+
+4
+
+    url = f'http://books.toscrape.com/catalogue/category/books_1/page-{i}.html'
+
+5
+
+    req = urllib3.PoolManager()
+
+6
+
+    res = req.request('GET', url)
+
+7
+
+    soup = BeautifulSoup(res.data, 'html.parser')
+
+8
+
+    contents = soup.find_all(class_= 'product_pod')
+
+
+Because there are 50 pages, our range will need to be from 1 to 51 in order to capture all of them. Our URL takes us to the first page. Throughout each iteration, one will be added to i, giving us a new URL each time.
+
+The PoolManager method allows for arbitrary requests while transparently keeping track of connection pools for us. The type of request that we are initiating to our URL is a GET request, which means that all we want is data.
+
+Using Beautiful Soup, we pull all of the data from our request, specifically the HTML data. If we take a look at the source code on our webpage, we'll notice that all of the products fall under the class product_pod. By calling the find_all method, we request all of the HTML with the class of product_pod.
+1
+
+#Based off of the title parameter within the site html
+
+2
+
+        for i in soup.find_all():
+
+3
+
+            titles.append(i['title'])
+
+
+If we look once again at the source data, we notice that the title appears twice — once as the inner text and the other as the value for the parameter title. Normally, we would extract from the inner HTML, but since the inner text cuts off most of the title we have to extract from within a tag.
+1
+
+#Temporary lists for British currency conversions
+
+2
+
+        pounds = []
+
+3
+
+        c = []
+
+4
+
+​
+
+5
+
+        for i in contents:
+
+6
+
+            c.append(i.find().get_text())
+
+7
+
+            for number in c:
+
+8
+
+                #Extract the British Pound symbol and join the numbers and decimal points back together
+
+9
+
+                amount = re.compile('[0-9]+.')
+
+10
+
+                num = amount.findall(number)
+
+11
+
+                pounds.append(float(''.join(num)))
+
+
+Just like we did for the title, we are going to extract all of the HTML that falls within the price_color class. Now, remember that all of the prices are in British Pounds; so we need to remove the Pound symbol and replace it with the dollar sign. Before that, we extract all of the numbers and decimals from the gathered prices using regex. Once we have a list of numbers and decimals, we join and then append the floats to our temporary pounds list.
+1
+
+#Create a temporary list for the current loop and append to the master list after we run the conversion function
+
+2
+
+    temp = list(map(gbp_to_usd_rounded,pounds))
+
+3
+
+​
+
+4
+
+    for t in temp:
+
+5
+
+        prices.append(t)
+
+6
+
+​
+
+7
+
+    #Combine both lists into a dictionary
+
+8
+
+    res = dict(zip(titles,prices))
+
+
+Again, we create another temporary list and call our conversion function on the Pounds list we just created. Finally, we run a quick for loop and append those items to our master prices list.
+
+Now that we have both master lists, we're able to create a dictionary using the zip method. Make sure that this is outside of any loops; otherwise, it won't work as intended.
+Conclusion
+
+We open the specified filename with the intent to write. With Python 3 when we are web scraping, we have to include the argument otherwise the spreadsheet will have blank lines between each entry. We run a simple iteration through the dictionary ensuring that our keys match the headers that we specified. Finally we execute get_book_data with our file title and extension, wait about 20-30 seconds and boom we have an excel document with all of the titles and prices from our target website!
+1
+
+#Create an Excel Document with the dictionary
+
+2
+
+    with open(filename,'w',) as file:
+
+3
+
+        headers = ("Book Title", 'Price (in usd)')
+
+4
+
+        csv_writer = DictWriter(file,)
+
+5
+
+        csv_writer.writeheader()
+
+6
+
+​
+
+7
+
+        for k,v in res.items():
+
+8
+
+            csv_writer.writerow({
+
+9
+
+                'Book Title' : k,
+
+10
+
+                'Price (in usd)' : v
+
+11
+
+        })
+
+12
+
+​
+
+13
+
+get_book_data('BookResearch_Beta.csv')
+
+
+If you found value in this article, please share and leave a comment below. Let me know what projects you are working or would like to see in the future. You can find all of the source code on my GitHub. Until next time!
+Python (language) Beautiful Soup
+
+Published at DZone with permission of Leaundrae Mckinney. See the original article here.
+
+Opinions expressed by DZone contributors are their own.
+Related
+
+    AI-Driven Alpha: Building Equity Models That Survive Emerging Markets
+    Reproducible SadTalker Pipeline in Google Colab for Single-Image, Single-Audio Talking-Head Generation
+    Real-Time Computer Vision on macOS: Accelerating Vision Transformers
+    Building a Production-Ready MCP Server in Python
+
+
